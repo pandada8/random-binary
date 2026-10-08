@@ -25,8 +25,10 @@ gh workflow run proxmox-backup-client.yml --repo pandada8/random-binary
 gh run list --repo pandada8/random-binary --workflow proxmox-backup-client.yml
 ```
 
-Every successful run creates a new GitHub Release with a distinct tag. Both
-the Actions artifact and Release contain only the `proxmox-backup-client` binary.
+Release tags follow the upstream version, e.g. `proxmox-backup-client-v4.2.0`.
+Rebuilding the same version replaces its binary and updates its Release notes
+without creating another tag. Both the Actions artifact and Release contain
+only the `proxmox-backup-client` binary.
 No source archive, patch, README, dependency report, or checksum file is uploaded.
 The binary SHA256 is recorded in the Release notes.
 

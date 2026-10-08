@@ -72,15 +72,15 @@ jobs:
           name: proxmox-backup-client-release
           path: dist
 
-      - name: Publish a new release for this build
+      - name: Publish or update the upstream-version release
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
-          # Distinct tags avoid overwriting old assets when manually rebuilding.
-          release_tag="proxmox-backup-client-${UPSTREAM_TAG}-static-nofuse-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          # Keep a short, stable URL; rebuilds replace the binary for this version.
+          release_tag="proxmox-backup-client-${UPSTREAM_TAG}"
           binary_sha256=$(sha256sum dist/proxmox-backup-client | cut -d' ' -f1)
           cat > release-notes.md <<EOF
           Proxmox Backup Client ${UPSTREAM_TAG}, fully static Linux x86_64, without FUSE.
@@ -101,8 +101,14 @@ jobs:
           recipe commit above; apply proxmox-backup-client/no-fuse.patch to the pinned
           upstream commit. APT dependencies are resolved at build time.
           EOF
-          gh release create "$release_tag" dist/proxmox-backup-client \
-            --repo "$GH_REPO" --target "$GITHUB_SHA" \
-            --title "proxmox-backup-client ${UPSTREAM_TAG} static no-FUSE (build ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT})" \
-            --notes-file release-notes.md
+          if gh release view "$release_tag" --repo "$GH_REPO" > /dev/null 2>&1; then
+            gh release upload "$release_tag" dist/proxmox-backup-client \
+              --repo "$GH_REPO" --clobber
+            gh release edit "$release_tag" --repo "$GH_REPO" \
+              --title "$release_tag" --notes-file release-notes.md
+          else
+            gh release create "$release_tag" dist/proxmox-backup-client \
+              --repo "$GH_REPO" --target "$GITHUB_SHA" \
+              --title "$release_tag" --notes-file release-notes.md
+          fi
           printf 'Published release: `%s`\n' "$release_tag" >> "$GITHUB_STEP_SUMMARY"
