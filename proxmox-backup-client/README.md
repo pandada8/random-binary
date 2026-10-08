@@ -25,21 +25,18 @@ gh workflow run proxmox-backup-client.yml --repo pandada8/random-binary
 gh run list --repo pandada8/random-binary --workflow proxmox-backup-client.yml
 ```
 
-Every successful run creates a new GitHub Release with a distinct tag. It uploads:
-
-- `proxmox-backup-client-v4.2.0-nofuse-linux-x86_64-static.tar.xz`: binary, patch,
-  copyright information, runtime library list, and build metadata.
-- `proxmox-backup-client-v4.2.0-nofuse-source.tar.xz`: patched upstream source,
-  including the client-only workspace manifest and Cargo.lock.
-- `SHA256SUMS`, `Cargo.lock`, `no-fuse.patch`, dependency tree, CLI help,
-  ELF/runtime library reports, and installed package versions.
-
-Extract the binary archive and install the `proxmox-backup-client` executable
-in your PATH. No shared libraries need to be installed. Verify downloads:
+Every successful run creates a new GitHub Release with a distinct tag. Both
+the Actions artifact and Release contain only the `proxmox-backup-client` binary.
+No source archive, patch, README, dependency report, or checksum file is uploaded.
+The binary SHA256 is recorded in the Release notes.
 
 ```sh
-sha256sum -c SHA256SUMS
+gh release download --repo pandada8/random-binary --pattern proxmox-backup-client
+chmod +x proxmox-backup-client
 ```
+
+Install the executable in your PATH. No extraction or shared library installation
+is needed.
 
 ## Compatibility and limitations
 
@@ -61,8 +58,8 @@ backup against a PBS server, because the workflow does not require credentials.
 
 Upstream tag/commit, Actions revisions, and the Debian image digest are pinned.
 APT packages are **not** snapshot-pinned: rebuilds may use newer compatible
-packaged crates. Exact versions are attached in `build-info.txt`; this is not a
-bit-for-bit reproducible build guarantee.
+packaged crates. Dependency installation and verification output remain in the
+CI logs; this is not a bit-for-bit reproducible build guarantee.
 
 ## Updating the recipe
 
@@ -72,5 +69,6 @@ bit-for-bit reproducible build guarantee.
 4. Run the workflow and inspect its build and no-FUSE verification results.
 
 Only build recipes and patches are committed here, not upstream source or
-binaries. Upstream copyright and AGPL licensing remain in force; the modified
-upstream source is distributed with each Release.
+binaries. Upstream copyright and AGPL licensing remain in force. The pinned
+upstream commit, public patch, and build script describe the source changes
+and how to build the modified client.

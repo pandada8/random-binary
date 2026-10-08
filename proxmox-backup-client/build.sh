@@ -8,6 +8,8 @@ output_dir=${2:?usage: build.sh SOURCE_DIR OUTPUT_DIR}
 : "${UPSTREAM_TAG:?}" "${UPSTREAM_COMMIT:?}"
 mkdir -p "$output_dir"
 output_dir=$(realpath "$output_dir")
+work_dir=$(mktemp -d)
+trap 'rm -rf "$work_dir"' EXIT
 cd "$source_dir"
 [[ $(git rev-parse HEAD) == "$UPSTREAM_COMMIT" ]]
 git apply --check "$recipe_dir/no-fuse.patch"
@@ -26,7 +28,7 @@ apt-get update
 # Make a client-only virtual workspace. Otherwise Cargo resolves unused server,
 # pxar-bin and file-restore members too, bringing FUSE back into Cargo.lock.
 # Discover the local dependency closure rather than maintaining a duplicated list.
-python3 - "$output_dir" <<'PY'
+python3 - "$work_dir" <<'PY'
 import pathlib
 import re
 import sys
@@ -84,19 +86,19 @@ pathlib.Path(sys.argv[1], 'rust-build-packages.txt').write_text('\n'.join(requir
 print('Client-only workspace:', ', '.join(sorted(members)))
 PY
 
-mapfile -t rust_packages < "$output_dir/rust-build-packages.txt"
+mapfile -t rust_packages < "$work_dir/rust-build-packages.txt"
 apt-get install -y --no-install-recommends \
   cargo rustc build-essential pkg-config clang libclang-dev \
   libssl-dev libacl1-dev libsystemd-dev libudev-dev uuid-dev libpam0g-dev \
-  libzstd-dev liblzma-dev libcrypt-dev binutils file xz-utils \
+  libzstd-dev liblzma-dev libcrypt-dev binutils file \
   "${rust_packages[@]}"
 
 # Do not reuse a lockfile produced against a different source registry.
 rm -f Cargo.lock
 cargo generate-lockfile --offline
 cargo tree --offline --locked -p proxmox-backup-client --prefix none \
-  > "$output_dir/cargo-tree.txt"
-if grep -Eiq '(^|[ /_-])fuse([ _-]|$|[0-9])' "$output_dir/cargo-tree.txt"; then
+  | tee "$work_dir/cargo-tree.txt"
+if grep -Eiq '(^|[ /_-])fuse([ _-]|$|[0-9])' "$work_dir/cargo-tree.txt"; then
   echo 'ERROR: FUSE remains in the client dependency graph' >&2
   exit 1
 fi
@@ -122,59 +124,34 @@ cargo build --offline --locked --release --target "$target" \
   -p proxmox-backup-client --bin proxmox-backup-client
 binary="target/$target/release/proxmox-backup-client"
 strip --strip-unneeded "$binary"
-file "$binary" > "$output_dir/file.txt"
-readelf -d "$binary" > "$output_dir/elf-dynamic.txt"
-readelf -l "$binary" > "$output_dir/elf-program-headers.txt"
-if grep -Eq 'NEEDED' "$output_dir/elf-dynamic.txt" || \
-   grep -Eq 'INTERP' "$output_dir/elf-program-headers.txt"; then
+file "$binary"
+readelf -d "$binary" | tee "$work_dir/elf-dynamic.txt"
+readelf -l "$binary" | tee "$work_dir/elf-program-headers.txt"
+if grep -Eq 'NEEDED' "$work_dir/elf-dynamic.txt" || \
+   grep -Eq 'INTERP' "$work_dir/elf-program-headers.txt"; then
   echo 'ERROR: binary is not fully static (shared library or interpreter present)' >&2
   exit 1
 fi
-ldd "$binary" > "$output_dir/runtime-libraries.txt" 2>&1 || true
+ldd "$binary" > "$work_dir/runtime-libraries.txt" 2>&1 || true
 # glibc ldd returns 0 for static PIE, but 1 for some other static ELF files.
-if ! grep -Eq 'statically linked|not a dynamic executable' "$output_dir/runtime-libraries.txt"; then
+if ! grep -Eq 'statically linked|not a dynamic executable' "$work_dir/runtime-libraries.txt"; then
   echo 'ERROR: ldd did not recognize a static binary' >&2
   exit 1
 fi
 # Smoke-test inside an empty rootfs: no shared libraries, loader, or libfuse.
-rootfs=$(mktemp -d)
+rootfs="$work_dir/rootfs"
 mkdir -p "$rootfs/tmp"
 install -m755 "$binary" "$rootfs/proxmox-backup-client"
-chroot "$rootfs" /proxmox-backup-client help > "$output_dir/client-help.txt" 2>&1
-chroot "$rootfs" /proxmox-backup-client help backup > "$output_dir/backup-help.txt" 2>&1
+chroot "$rootfs" /proxmox-backup-client help > "$work_dir/client-help.txt" 2>&1
+chroot "$rootfs" /proxmox-backup-client help backup > "$work_dir/backup-help.txt" 2>&1
 chroot "$rootfs" /proxmox-backup-client help restore > /dev/null 2>&1
 chroot "$rootfs" /proxmox-backup-client help catalog shell > /dev/null 2>&1
 rm -rf "$rootfs"
-if grep -Eq '(^|[[:space:]])(mount|map|unmap)([[:space:]]|$)' "$output_dir/client-help.txt"; then
+if grep -Eq '(^|[[:space:]])(mount|map|unmap)([[:space:]]|$)' "$work_dir/client-help.txt"; then
   echo 'ERROR: FUSE commands remain in CLI help' >&2
   exit 1
 fi
 
-asset="proxmox-backup-client-${UPSTREAM_TAG}-nofuse-linux-x86_64-static"
-staging=$(mktemp -d)
-trap 'rm -rf "$staging"' EXIT
-mkdir "$staging/$asset"
-install -m755 "$binary" "$staging/$asset/proxmox-backup-client"
-install -m644 debian/copyright "$staging/$asset/COPYRIGHT"
-cp "$recipe_dir/README.md" "$staging/$asset/README.md"
-cp "$recipe_dir/no-fuse.patch" "$staging/$asset/no-fuse.patch"
-cp "$output_dir/runtime-libraries.txt" "$staging/$asset/"
-{
-  printf 'upstream_tag=%s\nupstream_commit=%s\nrecipe_commit=%s\n' \
-    "$UPSTREAM_TAG" "$UPSTREAM_COMMIT" "${RECIPE_COMMIT:-local}"
-  printf 'patch_sha256=%s\n' "$(sha256sum "$recipe_dir/no-fuse.patch" | cut -d' ' -f1)"
-  rustc --version
-  cargo --version
-  dpkg-query -W -f='${binary:Package}=${Version}\n'
-} > "$output_dir/build-info.txt"
-cp "$output_dir/build-info.txt" "$staging/$asset/"
-tar -C "$staging" -cJf "$output_dir/$asset.tar.xz" "$asset"
-
-# Provide the patched upstream source and exact lockfile alongside the binary.
-# No upstream source is committed to the recipe repository.
-{ git ls-files -z; printf 'Cargo.lock\0'; } | \
-  tar --null -T - --transform="s,^,proxmox-backup-client-${UPSTREAM_TAG}-source/," \
-  -cJf "$output_dir/proxmox-backup-client-${UPSTREAM_TAG}-nofuse-source.tar.xz"
-cp Cargo.lock "$output_dir/Cargo.lock"
-cp "$recipe_dir/no-fuse.patch" "$output_dir/no-fuse.patch"
-(cd "$output_dir" && sha256sum ./*.tar.xz > SHA256SUMS)
+# Publish only the executable; reports remain in CI logs or temporary files.
+install -m755 "$binary" "$output_dir/proxmox-backup-client"
+sha256sum "$output_dir/proxmox-backup-client"
