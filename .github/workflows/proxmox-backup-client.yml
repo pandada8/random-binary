@@ -1,0 +1,105 @@
+name: Build proxmox-backup-client (static, no FUSE)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proxmox-backup-client-release
+  cancel-in-progress: false
+
+env:
+  # Latest upstream release tag when this recipe was added (2026-10-08).
+  # Change tag, commit and patch together when upgrading.
+  UPSTREAM_TAG: v4.2.0
+  UPSTREAM_COMMIT: 035c449897fafc228c8bbf3a5b5ba38564478ac7
+  BUILD_IMAGE: debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Check out build recipes
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Fetch the pinned upstream tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "$UPSTREAM_TAG" \
+            https://git.proxmox.com/git/proxmox-backup.git upstream
+          test "$(git -C upstream rev-parse HEAD)" = "$UPSTREAM_COMMIT"
+
+      - name: Build and verify in Debian (without FUSE installed)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker run --rm --platform linux/amd64 \
+            -e UPSTREAM_TAG -e UPSTREAM_COMMIT -e RECIPE_COMMIT="$GITHUB_SHA" \
+            -v "$GITHUB_WORKSPACE:/work" -w /work/upstream \
+            "$BUILD_IMAGE" bash -euo pipefail -c '
+              export DEBIAN_FRONTEND=noninteractive
+              apt-get update
+              apt-get install -y --no-install-recommends ca-certificates curl python3 git
+              git config --global --add safe.directory /work/upstream
+              bash /work/proxmox-backup-client/build.sh /work/upstream /work/dist
+            '
+
+      - name: Retain build output
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: proxmox-backup-client-release
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: proxmox-backup-client-release
+          path: dist
+
+      - name: Publish a new release for this build
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Distinct tags avoid overwriting old assets when manually rebuilding.
+          release_tag="proxmox-backup-client-${UPSTREAM_TAG}-static-nofuse-${GITHUB_RUN_NUMBER}-${GITHUB_RUN_ATTEMPT}"
+          cat > release-notes.md <<EOF
+          Proxmox Backup Client ${UPSTREAM_TAG}, fully static Linux x86_64, without FUSE.
+
+          - Upstream tag: \`${UPSTREAM_TAG}\`
+          - Upstream commit: \`${UPSTREAM_COMMIT}\`
+          - Build recipe commit: \`${GITHUB_SHA}\`
+          - Removed commands: \`mount\`, \`map\`, \`unmap\`.
+          - Backup, restore and catalog shell are retained.
+          - Fully static GNU/glibc build (not musl), built on Debian 13 (trixie).
+          - No ELF interpreter or shared library dependencies; no libfuse required.
+          - This is an unofficial build.
+          - Checks: no-FUSE dependency tree/packages, ELF/ldd and CLI help in an empty chroot.
+          - Patched upstream source, Cargo.lock, patch and SHA256SUMS are attached.
+
+          APT dependencies are resolved at build time; their exact installed versions
+          are recorded in build-info.txt. The upstream source and build image are pinned.
+          EOF
+          gh release create "$release_tag" dist/* \
+            --repo "$GH_REPO" --target "$GITHUB_SHA" \
+            --title "proxmox-backup-client ${UPSTREAM_TAG} static no-FUSE (build ${GITHUB_RUN_NUMBER}.${GITHUB_RUN_ATTEMPT})" \
+            --notes-file release-notes.md
+          printf 'Published release: `%s`\n' "$release_tag" >> "$GITHUB_STEP_SUMMARY"

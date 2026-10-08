@@ -1,0 +1,137 @@
+diff --git a/proxmox-backup-client/Cargo.toml b/proxmox-backup-client/Cargo.toml
+index 5f0140e78..c3e7be6e2 100644
+--- a/proxmox-backup-client/Cargo.toml
++++ b/proxmox-backup-client/Cargo.toml
+@@ -38,7 +38,5 @@ pbs-api-types.workspace = true
+ pbs-buildcfg.workspace = true
+ pbs-client.workspace = true
+ pbs-datastore.workspace = true
+-pbs-fuse-loop.workspace = true
+ pbs-key-config.workspace = true
+-pbs-pxar-fuse.workspace = true
+ pbs-tools.workspace = true
+diff --git a/proxmox-backup-client/src/catalog.rs b/proxmox-backup-client/src/catalog.rs
+index 5096378bb..fddb5f66d 100644
+--- a/proxmox-backup-client/src/catalog.rs
++++ b/proxmox-backup-client/src/catalog.rs
+@@ -222,7 +222,7 @@ async fn catalog_shell(param: Value) -> Result<(), Error> {
+ 
+     if let Err(_err) = manifest.lookup_file_info(&CATALOG_NAME) {
+         // No catalog, fallback to pxar archive accessor if present
+-        let accessor = helper::get_pxar_fuse_accessor(
++        let accessor = helper::get_pxar_accessor(
+             &server_archive_name,
+             client.clone(),
+             &manifest,
+@@ -240,7 +240,7 @@ async fn catalog_shell(param: Value) -> Result<(), Error> {
+ 
+     let mut tmpfile = pbs_client::tools::create_tmp_file()?;
+ 
+-    let decoder = helper::get_pxar_fuse_accessor(
++    let decoder = helper::get_pxar_accessor(
+         &server_archive_name,
+         client.clone(),
+         &manifest,
+diff --git a/proxmox-backup-client/src/helper.rs b/proxmox-backup-client/src/helper.rs
+index 642d66a7b..83f847a5c 100644
+--- a/proxmox-backup-client/src/helper.rs
++++ b/proxmox-backup-client/src/helper.rs
+@@ -1,6 +1,7 @@
+ use std::sync::Arc;
+ 
+ use anyhow::Error;
++use pxar::accessor::{aio, ReadAt};
+ use pbs_api_types::BackupArchiveName;
+ use pbs_client::{BackupReader, RemoteChunkReader};
+ use pbs_datastore::BackupManifest;
+@@ -8,16 +9,20 @@ use pbs_tools::crypt_config::CryptConfig;
+ 
+ use crate::{BufferedDynamicReadAt, BufferedDynamicReader, IndexFile};
+ 
+-pub(crate) async fn get_pxar_fuse_accessor(
++// Archive access does not require a FUSE filesystem.
++type Reader = Arc<dyn ReadAt + Send + Sync + 'static>;
++type Accessor = aio::Accessor<Reader>;
++
++pub(crate) async fn get_pxar_accessor(
+     archive_name: &BackupArchiveName,
+     client: Arc<BackupReader>,
+     manifest: &BackupManifest,
+     crypt_config: Option<Arc<CryptConfig>>,
+-) -> Result<pbs_pxar_fuse::Accessor, Error> {
++) -> Result<Accessor, Error> {
+     let (archive_name, payload_archive_name) =
+         pbs_client::tools::get_pxar_archive_names(archive_name, manifest)?;
+ 
+-    let (reader, archive_size) = get_pxar_fuse_reader(
++    let (reader, archive_size) = get_pxar_reader(
+         &archive_name,
+         client.clone(),
+         manifest,
+@@ -26,7 +31,7 @@ pub(crate) async fn get_pxar_fuse_accessor(
+     .await?;
+ 
+     let reader = if let Some(payload_archive_name) = payload_archive_name {
+-        let (payload_reader, payload_size) = get_pxar_fuse_reader(
++        let (payload_reader, payload_size) = get_pxar_reader(
+             &payload_archive_name,
+             client.clone(),
+             manifest,
+@@ -39,20 +44,20 @@ pub(crate) async fn get_pxar_fuse_accessor(
+         pxar::PxarVariant::Unified(reader)
+     };
+ 
+-    let accessor = pbs_pxar_fuse::Accessor::new(reader, archive_size).await?;
++    let accessor = Accessor::new(reader, archive_size).await?;
+ 
+     Ok(accessor)
+ }
+ 
+-pub(crate) async fn get_pxar_fuse_reader(
++pub(crate) async fn get_pxar_reader(
+     archive_name: &BackupArchiveName,
+     client: Arc<BackupReader>,
+     manifest: &BackupManifest,
+     crypt_config: Option<Arc<CryptConfig>>,
+-) -> Result<(pbs_pxar_fuse::Reader, u64), Error> {
++) -> Result<(Reader, u64), Error> {
+     let reader = get_buffered_pxar_reader(archive_name, client, manifest, crypt_config).await?;
+     let archive_size = reader.archive_size();
+-    let reader: pbs_pxar_fuse::Reader = Arc::new(BufferedDynamicReadAt::new(reader));
++    let reader: Reader = Arc::new(BufferedDynamicReadAt::new(reader));
+ 
+     Ok((reader, archive_size))
+ }
+diff --git a/proxmox-backup-client/src/main.rs b/proxmox-backup-client/src/main.rs
+index 5e8bb5393..2633038b2 100644
+--- a/proxmox-backup-client/src/main.rs
++++ b/proxmox-backup-client/src/main.rs
+@@ -35,7 +35,7 @@ use pbs_client::pxar::{ErrorHandler as PxarErrorHandler, MetadataArchiveReader,
+ use pbs_client::tools::{
+     complete_archive_name, complete_auth_id, complete_backup_group, complete_backup_snapshot,
+     complete_backup_source, complete_chunk_size, complete_group_or_snapshot,
+-    complete_img_archive_name, complete_namespace, complete_pxar_archive_name, complete_repository,
++    complete_namespace, complete_pxar_archive_name, complete_repository,
+     connect, connect_rate_limited, extract_repository_from_value,
+     key_source::{
+         crypto_parameters, format_key_source, get_encryption_key_password, KEYFD_SCHEMA,
+@@ -76,9 +76,6 @@ pub use group::*;
+ mod helper;
+ pub(crate) use helper::*;
+ 
+-mod mount;
+-pub use mount::*;
+-
+ mod snapshot;
+ pub use snapshot::*;
+ 
+@@ -2122,9 +2119,6 @@ fn main() {
+         .insert("snapshot", snapshot_mgtm_cli())
+         .insert("status", status_cmd_def)
+         .insert("key", key::cli())
+-        .insert("mount", mount_cmd_def())
+-        .insert("map", map_cmd_def())
+-        .insert("unmap", unmap_cmd_def())
+         .insert("catalog", catalog_mgmt_cli())
+         .insert("task", task_mgmt_cli())
+         .insert("version", version_cmd_def)
